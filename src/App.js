@@ -12,7 +12,7 @@ import {
 import './ScheduleSystem.css';
 
 /* =========================
-   패턴/배치 유틸리티
+   유틸리티 & 규칙
    ========================= */
 
 const isWeekend = (day) => day === '토요일' || day === '일요일';
@@ -32,12 +32,12 @@ const getDayAssignedSlots = (schedule, day, personName) => {
 
 /**
  * 평일 패턴 유효성 체크
- * - 길이 1: 언제나 OK (2h)
- * - 길이 2: 반드시 인접(연속)해야 함 (4h는 붙여서)
+ * - 길이 1: OK (2h)
+ * - 길이 2: 인접해야 함 (4h는 붙여서)
  * - 길이 3: (a,b,c) 오름차순에서
  *    (b==a+1 && c>=b+2)  => 4h 연속 + 2h는 최소 1슬롯(2h) 떨어짐
  *  OR(c==b+1 && a<=b-2)  => 2h + 최소 1슬롯(2h) 휴게 + 4h 연속
- * - 그 외(4개 이상)는 금지 (평일 하루 6h 제한 가정)
+ * - 그 외(4개 이상)는 불가(평일 하루 6h 제한)
  */
 const isWeekdayPatternValid = (orderedSlots) => {
   const n = orderedSlots.length;
@@ -52,24 +52,32 @@ const isWeekdayPatternValid = (orderedSlots) => {
   return false;
 };
 
-/** 해당 슬롯에 배치해도 패턴/시간 제약을 만족하는지 검사 */
-const canAssignWithPattern = (schedule, day, person, slotId, dailyHours) => {
+/** 해당 슬롯 배치 가능 여부(주말 규칙/평일 6h/패턴/토글 반영) */
+const canAssignWithRules = ({
+  schedule,
+  day,
+  person,
+  slotId,
+  dailyHours,
+  enforceContiguity, // 새 옵션
+}) => {
   if (person.remainingHours < 2) return false;
 
   const daySchedule = schedule[day];
   const slot = daySchedule.find((s) => s.id === slotId);
   if (slot.assigned.some((p) => p.name === person.name)) return false;
 
+  // 주말: 1일 6h 제한 없음, 패턴 제약 해제(연속 6h 이상 가능)
+  if (isWeekend(day)) return true;
+
+  // 평일: 1일 6h 제한
+  if (dailyHours[day][person.name] >= 6) return false;
+
+  // 평일 패턴: 토글 ON일 때만 강제
+  if (!enforceContiguity) return true;
+
   const existing = getDayAssignedSlots(schedule, day, person.name);
   const next = [...existing, slotId].sort((a, b) => a - b);
-
-  // 주말: 하루 6h 제한 없음, 패턴 제약 해제(연속 6h 이상도 가능)
-  if (isWeekend(day)) {
-    return true;
-  }
-
-  // 평일: 하루 6h 제한 + 패턴 제약
-  if (dailyHours[day][person.name] >= 6) return false;
   return isWeekdayPatternValid(next);
 };
 
@@ -102,6 +110,9 @@ const ScheduleSystem = () => {
   const [people, setPeople] = useState(initialPeople.map((p) => ({ ...p })));
   const [showSettings, setShowSettings] = useState(false);
   const [editingHours, setEditingHours] = useState(false);
+
+  // ✅ 새 옵션: 평일 연속 강제 여부
+  const [enforceContiguity, setEnforceContiguity] = useState(true);
 
   const [requiredStaff, setRequiredStaff] = useState({
     1: 2,
@@ -150,14 +161,14 @@ const ScheduleSystem = () => {
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
-  // 자동 스케줄링 (이미 배치된 슬롯 유지 + 평일 규칙 적용 / 주말은 건드리지 않음)
+  // 자동 스케줄링 (이미 배치된 슬롯 유지 + 평일 규칙/토글 반영, 주말은 그대로)
   const autoSchedule = () => {
     const confirmAuto = window.confirm(
       '현재 스케줄을 유지한 채, 부족한 자리만 자동으로 채울까요? (주중/주말 기존 배치는 변경되지 않습니다)'
     );
     if (!confirmAuto) return;
 
-    // 1) 현재 스케줄 깊은 복사 (주중/주말 모두 유지)
+    // 1) 현재 스케줄 깊은 복사
     const newSchedule = {};
     daysOfWeek.forEach((day) => {
       newSchedule[day] = weekSchedule[day].map((s) => ({
@@ -166,7 +177,7 @@ const ScheduleSystem = () => {
       }));
     });
 
-    // 2) 현재 전체 배치 시간을 기준으로 남은 시간 재계산
+    // 2) 현재 전체 배치 기준 남은시간 재계산
     const currentAssignedHours = {};
     daysOfWeek.forEach((day) => {
       weekSchedule[day].forEach((slot) => {
@@ -182,7 +193,7 @@ const ScheduleSystem = () => {
       remainingHours: p.totalHours - (currentAssignedHours[p.name] || 0),
     }));
 
-    // 3) 일일 사용 시간(dailyHours) 초기화: 이미 배치된 시간 반영(평일/주말 모두)
+    // 3) 일일 사용 시간 초기화 (이미 배치 반영)
     const dailyHours = {};
     daysOfWeek.forEach((day) => {
       dailyHours[day] = {};
@@ -195,51 +206,41 @@ const ScheduleSystem = () => {
       });
     });
 
-    // 4) **평일만** 자동 충원 (주말은 기존 배치 유지만)
-    const weekdaysSet = new Set([
-      '월요일',
-      '화요일',
-      '수요일',
-      '목요일',
-      '금요일',
-    ]);
+    // 4) 평일만 부족분 충원 (주말은 유지)
+    const weekdaysSet = new Set(weekdays);
     weekdays.forEach((day) => {
       if (!weekdaysSet.has(day)) return;
 
       newSchedule[day].forEach((slot) => {
         const required = requiredStaff[slot.id] || 0;
         const already = slot.assigned.length;
-
-        // 이미 충족/초과면 손대지 않음
         const need = Math.max(0, required - already);
         if (need === 0) return;
 
         const additions = [];
-
         for (let i = 0; i < need; i++) {
-          // 후보 필터: 패턴(평일 규칙) / 6h / 잔여시간
+          // 후보 필터: 패턴/6h/잔여시간/토글 반영
           const candidates = updatedPeople.filter((person) => {
             if (additions.some((p) => p.name === person.name)) return false; // 이번 슬롯 내 중복 방지
-            if (slot.assigned.some((p) => p.name === person.name)) return false; // 이미 이 슬롯에 있는 경우
-            return canAssignWithPattern(
-              newSchedule,
+            if (slot.assigned.some((p) => p.name === person.name)) return false; // 이미 이 슬롯 참여
+            return canAssignWithRules({
+              schedule: newSchedule,
               day,
               person,
-              slot.id,
-              dailyHours
-            );
+              slotId: slot.id,
+              dailyHours,
+              enforceContiguity,
+            });
           });
 
           if (candidates.length === 0) break;
 
-          // 인접 슬롯 보너스(4h 연속 유도) + 가중 랜덤
+          // 인접 슬롯 보너스(연속 유도) + 가중 랜덤
           const scored = candidates.map((p) => {
             const existing = getDayAssignedSlots(newSchedule, day, p.name);
-            const hasAdjacent = existing.some(
-              (id) => Math.abs(id - slot.id) === 1
-            );
+            const hasAdjacent = existing.some((id) => Math.abs(id - slot.id) === 1);
             let score = p.remainingHours + Math.random();
-            if (hasAdjacent) score += 0.6;
+            if (enforceContiguity && hasAdjacent) score += 0.6;
             return { person: p, score };
           });
 
@@ -261,7 +262,7 @@ const ScheduleSystem = () => {
 
     setWeekSchedule(newSchedule);
     setPeople(updatedPeople);
-    alert('자동 스케줄링이 완료되었습니다! (기존 배치는 유지됨, 평일만 충원)');
+    alert('자동 스케줄링이 완료되었습니다! (기존 배치는 유지됨)');
   };
 
   // 필요 인원 변경
@@ -278,9 +279,7 @@ const ScheduleSystem = () => {
     let assignedHours = 0;
     daysOfWeek.forEach((day) => {
       weekSchedule[day].forEach((slot) => {
-        if (slot.assigned.some((p) => p.name === personName)) {
-          assignedHours += 2;
-        }
+        if (slot.assigned.some((p) => p.name === personName)) assignedHours += 2;
       });
     });
     if (newHours < assignedHours) {
@@ -302,7 +301,7 @@ const ScheduleSystem = () => {
     );
   };
 
-  // 드래그/드롭 핸들러
+  // 드래그/드롭
   const handleDragStart = (person) => setDraggedPerson(person);
   const handleDragEnd = () => {
     setDraggedPerson(null);
@@ -339,13 +338,12 @@ const ScheduleSystem = () => {
     setSelectedCell(null);
   };
 
-  // 수동 배치도 규칙 준수 (주말: 제한 완화, 평일: 기존 규칙)
+  // 수동 배치 (주말 완화 / 평일 토글 반영)
   const assignPersonToSlot = (person, day, slotId) => {
     if (person.remainingHours < 2) {
       alert(`${person.name}님의 남은 시간이 부족합니다.`);
       return;
     }
-
     const daySchedule = weekSchedule[day];
     const slot = daySchedule.find((s) => s.id === slotId);
     if (slot.assigned.some((p) => p.name === person.name)) {
@@ -353,27 +351,24 @@ const ScheduleSystem = () => {
       return;
     }
 
-    // 일일 사용 시간 계산
+    // 일일 사용 시간
     const dayUsed = daySchedule.reduce(
-      (acc, s) =>
-        acc + (s.assigned.some((p) => p.name === person.name) ? 2 : 0),
+      (acc, s) => acc + (s.assigned.some((p) => p.name === person.name) ? 2 : 0),
       0
     );
 
-    // 평일만 6h 제한 적용
+    // 평일만 6h 제한
     if (!isWeekend(day) && dayUsed >= 6) {
       alert('평일에는 하루 최대 6시간을 초과할 수 없습니다.');
       return;
     }
 
-    // 패턴 유효성 체크: 평일만 적용, 주말은 해제(연속 6h 이상도 가능)
-    if (!isWeekend(day)) {
+    // 평일 패턴: 토글 ON일 때만 강제
+    if (!isWeekend(day) && enforceContiguity) {
       const existing = getDayAssignedSlots(weekSchedule, day, person.name);
       const next = [...existing, slotId].sort((a, b) => a - b);
       if (!isWeekdayPatternValid(next)) {
-        alert(
-          '평일 패턴(4h 연속 / 6h=4+휴게+2 또는 2+휴게+4)에 맞지 않습니다.'
-        );
+        alert('평일 패턴(4h는 붙여서 / 6h=4+휴게+2 또는 2+휴게+4)에 맞지 않습니다.');
         return;
       }
     }
@@ -384,9 +379,7 @@ const ScheduleSystem = () => {
       s.id === slotId ? { ...s, assigned: [...s.assigned, person] } : s
     );
     const updatedPeople = people.map((p) =>
-      p.name === person.name
-        ? { ...p, remainingHours: p.remainingHours - 2 }
-        : p
+      p.name === person.name ? { ...p, remainingHours: p.remainingHours - 2 } : p
     );
 
     setWeekSchedule(updatedWeekSchedule);
@@ -415,9 +408,7 @@ const ScheduleSystem = () => {
 
   // 초기화
   const resetAllSchedule = () => {
-    const confirmReset = window.confirm(
-      '전체 주간 스케줄을 초기화하시겠습니까?'
-    );
+    const confirmReset = window.confirm('전체 주간 스케줄을 초기화하시겠습니까?');
     if (confirmReset) {
       setWeekSchedule(initWeekSchedule());
       setPeople([...initialPeople.map((p) => ({ ...p }))]);
@@ -433,9 +424,7 @@ const ScheduleSystem = () => {
     daySchedule.forEach((slot) => {
       slot.assigned.forEach((person) => {
         updatedPeople = updatedPeople.map((p) =>
-          p.name === person.name
-            ? { ...p, remainingHours: p.remainingHours + 2 }
-            : p
+          p.name === person.name ? { ...p, remainingHours: p.remainingHours + 2 } : p
         );
       });
     });
@@ -492,9 +481,6 @@ const ScheduleSystem = () => {
     return {};
   };
 
-  // =========================
-  // 렌더링
-  // =========================
   return (
     <div className="app">
       <div className="container">
@@ -570,6 +556,23 @@ const ScheduleSystem = () => {
                     {editingHours ? '저장' : '수정'}
                   </button>
                 </div>
+
+                {/* ✅ 새 옵션: 평일 연속 강제 토글 */}
+                <div className="option-row">
+                  <label className="toggle">
+                    <input
+                      type="checkbox"
+                      checked={enforceContiguity}
+                      onChange={(e) => setEnforceContiguity(e.target.checked)}
+                    />
+                    <span>연속 강제 (평일)</span>
+                  </label>
+                  <div className="tiny muted">
+                    켜짐: 4h는 붙여서, 6h는 4+휴게+2 또는 2+휴게+4
+                    &nbsp;/&nbsp; 꺼짐: 패턴 제약 해제(평일 1일 6h 제한은 유지)
+                  </div>
+                </div>
+
                 <div className="list-scroll">
                   {people.map((person) => (
                     <div key={person.name} className="person-row">
@@ -599,14 +602,14 @@ const ScheduleSystem = () => {
                 </div>
               </div>
             </div>
+
             <div className="notice">
-              <strong>자동 배치 조건:</strong> 기존 배치는 유지 / 자동 충원은
-              평일만 / 평일: 1인당 하루 최대 6시간, 4h 연속·6h=4+휴게+2 또는
-              2+휴게+4 /
+              <strong>자동 배치 조건:</strong> 기존 배치는 유지 / 자동 충원은 평일만 /
+              평일: 1인당 하루 최대 6시간,&nbsp;
               <span className="emphasis-blue">
-                {' '}
-                주말: 6시간 이상 연속 배치도 가능(일일 6h 제한 없음)
+                연속 강제 토글에 따라 패턴 적용
               </span>
+              &nbsp;/ 주말: 6시간 이상 연속 배치 가능(일일 제한 없음)
             </div>
           </div>
         )}
@@ -629,13 +632,7 @@ const ScheduleSystem = () => {
                         <th key={day} className="th-day">
                           <div className="th-day-inner">
                             <span>{day}</span>
-                            {[
-                              '월요일',
-                              '화요일',
-                              '수요일',
-                              '목요일',
-                              '금요일',
-                            ].includes(day) && (
+                            {weekdays.includes(day) && (
                               <span className="badge-auto">자동</span>
                             )}
                             <button
@@ -658,14 +655,15 @@ const ScheduleSystem = () => {
                           <td className="sticky-left time-cell">
                             <div className="time-cell-inner">
                               <div className="time-range">
-                                <Clock className="icon-xs muted" /> {slot.start}{' '}
-                                - {slot.end}
+                                <Clock className="icon-xs muted" /> {slot.start} -{' '}
+                                {slot.end}
                               </div>
                               <span className="badge-gray">
                                 {currentRequired}명
                               </span>
                             </div>
                           </td>
+
                           {daysOfWeek.map((day) => {
                             const daySlot = weekSchedule[day].find(
                               (s) => s.id === slot.id
